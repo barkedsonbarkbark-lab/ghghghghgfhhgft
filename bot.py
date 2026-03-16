@@ -1,6 +1,8 @@
 import asyncio
 import os
+import time
 from typing import Dict, List, Optional, Tuple
+from urllib.error import HTTPError
 
 import discord
 from discord.ext import commands
@@ -42,19 +44,39 @@ async def search_youtube(query: str) -> Tuple[str, str]:
 
 
 def _extract_audio_url_sync(youtube_url: str) -> str:
-    yt = YouTube(youtube_url)
+    last_error: Optional[Exception] = None
 
-    # Prefer highest bitrate audio-only stream.
-    stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
-    if stream and stream.url:
-        return stream.url
+    # Try different clients and retry for transient HTTP errors.
+    clients: List[Optional[str]] = [None, "ANDROID", "WEB", "IOS"]
+    for attempt in range(3):
+        for client in clients:
+            try:
+                try:
+                    yt = YouTube(youtube_url, client=client) if client else YouTube(youtube_url)
+                except TypeError:
+                    # Older pytube versions may not support a `client` kwarg.
+                    yt = YouTube(youtube_url)
 
-    # Fallback: allow progressive streams that contain audio.
-    progressive = yt.streams.filter(progressive=True).order_by("resolution").desc().first()
-    if progressive and progressive.url:
-        return progressive.url
+                # Prefer highest bitrate audio-only stream.
+                stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
+                if stream and stream.url:
+                    return stream.url
 
-    raise RuntimeError("Could not find a playable audio stream with pytube")
+                # Fallback: allow progressive streams that contain audio.
+                progressive = yt.streams.filter(progressive=True).order_by("resolution").desc().first()
+                if progressive and progressive.url:
+                    return progressive.url
+            except HTTPError as error:
+                last_error = error
+                continue
+            except Exception as error:
+                last_error = error
+                continue
+
+        # brief backoff before retrying all clients
+        time.sleep(0.6 * (attempt + 1))
+
+    raise RuntimeError(f"Could not find a playable audio stream with pytube: {last_error}")
 
 
 async def extract_audio_url(youtube_url: str) -> str:
