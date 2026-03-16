@@ -61,20 +61,20 @@ async def extract_audio_url(youtube_url: str) -> str:
     return await asyncio.to_thread(_extract_audio_url_sync, youtube_url)
 
 
-async def play_next(guild_id: int) -> None:
+async def play_next(guild_id: int) -> bool:
     guild = bot.get_guild(guild_id)
     if guild is None:
-        return
+        return False
 
     voice = guild.voice_client
     if voice is None:
-        return
+        return False
 
     guild_queue = queues.get(guild_id, [])
     if len(guild_queue) == 0:
         await voice.disconnect()
         now_playing[guild_id] = None
-        return
+        return False
 
     if loop_mode.get(guild_id, False) and now_playing.get(guild_id):
         guild_queue.insert(0, now_playing[guild_id])
@@ -88,8 +88,7 @@ async def play_next(guild_id: int) -> None:
         print(f"Failed to extract playable stream for '{title}': {error}")
         now_playing[guild_id] = None
         # Attempt to continue with the next queued song instead of crashing the command.
-        await play_next(guild_id)
-        return
+        return await play_next(guild_id)
     source = discord.PCMVolumeTransformer(
         discord.FFmpegPCMAudio(
             stream_url,
@@ -113,6 +112,7 @@ async def play_next(guild_id: int) -> None:
             print(f"Queue callback error: {callback_error}")
 
     voice.play(source, after=after_play)
+    return True
 
 
 
@@ -187,7 +187,12 @@ async def play(interaction: discord.Interaction, query: str) -> None:
 
     vc = guild.voice_client
     if vc and not vc.is_playing() and not vc.is_paused():
-        await play_next(gid)
+        started = await play_next(gid)
+        if not started and not queues.get(gid):
+            await interaction.followup.send(
+                "I couldn't start playback for that track (stream extraction failed). Try another link/search."
+            )
+            return
 
     await interaction.followup.send(f"Added: **{title}**")
 
@@ -260,6 +265,7 @@ async def loop_cmd(interaction: discord.Interaction) -> None:
 def main() -> None:
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN environment variable is required")
+    print("Starting music bot (extractor backend: pytube)")
     bot.run(TOKEN)
 
 
