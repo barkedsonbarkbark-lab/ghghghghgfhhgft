@@ -43,10 +43,12 @@ async def search_youtube(query: str) -> Tuple[str, str]:
 
 def _extract_audio_url_sync(youtube_url: str) -> str:
     ydl_opts = {
-        "format": "bestaudio/best/best",
+        # Let yt-dlp return full metadata first, then we pick an audio-capable format.
+        # This avoids hard failing on videos where specific format selectors are missing.
         "cookiefile": "cookies.txt",
         "quiet": True,
         "noplaylist": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -95,7 +97,14 @@ async def play_next(guild_id: int) -> None:
     url, title = guild_queue.pop(0)
     now_playing[guild_id] = (url, title)
 
-    stream_url = await extract_audio_url(url)
+    try:
+        stream_url = await extract_audio_url(url)
+    except Exception as error:
+        print(f"Failed to extract playable stream for '{title}': {error}")
+        now_playing[guild_id] = None
+        # Attempt to continue with the next queued song instead of crashing the command.
+        await play_next(guild_id)
+        return
     source = discord.PCMVolumeTransformer(
         discord.FFmpegPCMAudio(
             stream_url,
