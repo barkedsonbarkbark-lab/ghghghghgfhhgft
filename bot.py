@@ -52,7 +52,10 @@ def _extract_audio_url_sync(youtube_url: str) -> str:
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=False)
+        try:
+            info = ydl.extract_info(youtube_url, download=False)
+        except yt_dlp.DownloadError as error:
+            raise RuntimeError(f"yt-dlp failed for {youtube_url}: {error}") from error
 
     if not info:
         raise RuntimeError("No information found")
@@ -129,6 +132,25 @@ async def play_next(guild_id: int) -> None:
 
     voice.play(source, after=after_play)
 
+
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction, error: discord.app_commands.AppCommandError
+) -> None:
+    message = "Something went wrong while running that command."
+    original = getattr(error, "original", None)
+    if original:
+        message = f"Command failed: {original}"
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message)
+        else:
+            await interaction.response.send_message(message)
+    except Exception:
+        pass
 
 @bot.event
 async def on_ready() -> None:
@@ -253,7 +275,11 @@ async def loop_cmd(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(f"Loop: **{loop_mode[gid]}**")
 
 
-if __name__ == "__main__":
+def main() -> None:
     if not TOKEN:
         raise RuntimeError("DISCORD_TOKEN environment variable is required")
     bot.run(TOKEN)
+
+
+if __name__ == "__main__":
+    main()
