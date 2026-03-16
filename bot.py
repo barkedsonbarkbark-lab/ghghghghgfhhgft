@@ -6,6 +6,7 @@ import discord
 import yt_dlp
 from discord.ext import commands
 from py_youtube_search import YouTubeSearch
+from pytube import YouTube
 
 # ---- CONFIG ----
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -41,21 +42,31 @@ async def search_youtube(query: str) -> Tuple[str, str]:
     return f"https://www.youtube.com/watch?v={video_id}", title
 
 
+def _extract_audio_url_with_pytube(youtube_url: str) -> str:
+    yt = YouTube(youtube_url)
+    stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
+    if not stream:
+        raise RuntimeError("pytube could not find an audio stream")
+    return stream.url
+
+
 def _extract_audio_url_sync(youtube_url: str) -> str:
     ydl_opts = {
         # Let yt-dlp return full metadata first, then we pick an audio-capable format.
         # This avoids hard failing on videos where specific format selectors are missing.
-        "cookiefile": "cookies.txt",
         "quiet": True,
         "noplaylist": True,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "extractor_args": {"youtube": {"player_client": ["android", "web", "ios"]}},
     }
+    if os.path.exists("cookies.txt"):
+        ydl_opts["cookiefile"] = "cookies.txt"
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(youtube_url, download=False)
-        except yt_dlp.DownloadError as error:
-            raise RuntimeError(f"yt-dlp failed for {youtube_url}: {error}") from error
+    except yt_dlp.DownloadError as error:
+        # Fallback for environments where yt-dlp cannot solve current YouTube challenges.
+        return _extract_audio_url_with_pytube(youtube_url)
 
     if not info:
         raise RuntimeError("No information found")
@@ -72,7 +83,8 @@ def _extract_audio_url_sync(youtube_url: str) -> str:
         if item.get("acodec") != "none":
             return item["url"]
 
-    raise RuntimeError("No playable audio formats found")
+    # Final fallback in case formats list is present but unusable.
+    return _extract_audio_url_with_pytube(youtube_url)
 
 
 async def extract_audio_url(youtube_url: str) -> str:
