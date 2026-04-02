@@ -112,6 +112,31 @@ function getSavedConnections(userId) {
   return db.users?.[uid] || null;
 }
 
+function getDbSummary() {
+  const db = readJson(CONNECTIONS_FILE, { users: {} });
+  const users = db.users || {};
+  const entries = Object.entries(users);
+  let last = null;
+  for (const [userId, entry] of entries) {
+    if (!entry?.updatedAt) continue;
+    if (!last || Number(entry.updatedAt) > Number(last.entry.updatedAt)) last = { userId, entry };
+  }
+  const fileExists = fs.existsSync(CONNECTIONS_FILE);
+  const stat = fileExists ? fs.statSync(CONNECTIONS_FILE) : null;
+  return {
+    file: {
+      path: CONNECTIONS_FILE,
+      exists: fileExists,
+      size: stat ? stat.size : 0,
+      mtimeMs: stat ? stat.mtimeMs : null,
+    },
+    users: {
+      count: entries.length,
+      last,
+    },
+  };
+}
+
 async function exchangeCodeForToken({ clientId, clientSecret, redirectUri, code }) {
   const body = new URLSearchParams();
   body.set('client_id', clientId);
@@ -225,6 +250,20 @@ app.get('/api/connections/:userId', (req, res) => {
   res.status(200).json({ userId, ...entry });
 });
 
+app.get('/api/debug', (req, res) => {
+  const apiKey = env('AURABOT_API_KEY').trim();
+  if (!apiKey) {
+    res.status(500).json({ error: 'Server not configured (missing AURABOT_API_KEY).' });
+    return;
+  }
+  const provided = String(req.header('x-api-key') || '').trim();
+  if (!provided || !timingSafeEq(provided, apiKey)) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+  res.status(200).json(getDbSummary());
+});
+
 app.get('/connect', (req, res) => {
   const clientId = env('DISCORD_CLIENT_ID').trim();
   const redirectUri = env('DISCORD_REDIRECT_URI').trim();
@@ -288,6 +327,8 @@ app.get('/callback', async (req, res) => {
   }
 
   try {
+    // eslint-disable-next-line no-console
+    console.log('[render-auth] /callback start', { hasCode: true });
     const token = await exchangeCodeForToken({ clientId, clientSecret, redirectUri, code });
     const accessToken = token?.access_token;
     if (!accessToken) throw new Error('Missing access token');
@@ -301,6 +342,8 @@ app.get('/callback', async (req, res) => {
 
     // Save for bot polling (no webhook needed)
     saveConnections(userId, picked);
+    // eslint-disable-next-line no-console
+    console.log('[render-auth] saved connections', { userId, youtube: picked.youtube || null, tiktok: picked.tiktok || null });
 
     const ts = String(Date.now());
     const payload = `${userId}|${picked.youtube || ''}|${picked.tiktok || ''}|${ts}`;
