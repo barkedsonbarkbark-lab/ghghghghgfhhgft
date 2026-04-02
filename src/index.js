@@ -1,12 +1,34 @@
-/* Load env vars from a local .env file (Render usually uses dashboard env vars,
- * but this keeps local/self-hosted deployments working too). */
+/* Load env vars from a local .env file when present.
+ * Note: Render normally expects env vars set in the dashboard; .env files are not
+ * uploaded unless you commit them (not recommended for secrets). */
+const fs = require('node:fs');
 const path = require('node:path');
 // eslint-disable-next-line global-require
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+const dotenv = require('dotenv');
+
+function tryLoadDotenv(dotenvPath) {
+  try {
+    if (!dotenvPath) return false;
+    if (!fs.existsSync(dotenvPath)) return false;
+    dotenv.config({ path: dotenvPath });
+    // eslint-disable-next-line no-console
+    console.log(`[render-auth] Loaded .env from ${dotenvPath}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Try CWD first (common when running from the render-auth folder), then script-relative.
+tryLoadDotenv(path.join(process.cwd(), '.env'));
+tryLoadDotenv(path.join(__dirname, '..', '.env'));
 
 const crypto = require('node:crypto');
 const express = require('express');
 const axios = require('axios');
+
+const DATA_DIR = path.join(__dirname, '..', 'data');
+const CONNECTIONS_FILE = path.join(DATA_DIR, 'connections.json');
 
 function env(name, fallback = '') {
   const v = process.env[name];
@@ -25,6 +47,13 @@ function hmacSig(secret, payload) {
   return base64url(crypto.createHmac('sha256', String(secret)).update(String(payload)).digest());
 }
 
+function timingSafeEq(a, b) {
+  const ab = Buffer.from(String(a || ''), 'utf8');
+  const bb = Buffer.from(String(b || ''), 'utf8');
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
 function pickConnectedAccounts(connections) {
   const out = { youtube: null, tiktok: null };
   const arr = Array.isArray(connections) ? connections : [];
@@ -34,6 +63,53 @@ function pickConnectedAccounts(connections) {
     if (type === 'tiktok' && !out.tiktok) out.tiktok = c?.name || c?.id || null;
   }
   return out;
+}
+
+function missingEnv(names) {
+  const missing = [];
+  for (const name of names) {
+    if (!env(name).trim()) missing.push(name);
+  }
+  return missing;
+}
+
+function ensureDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function readJson(file, fallback) {
+  try {
+    ensureDir();
+    if (!fs.existsSync(file)) return fallback;
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(file, value) {
+  ensureDir();
+  fs.writeFileSync(file, JSON.stringify(value, null, 2), 'utf8');
+}
+
+function saveConnections(userId, connections) {
+  const uid = String(userId || '').trim();
+  if (!uid) return null;
+  const db = readJson(CONNECTIONS_FILE, { users: {} });
+  if (!db.users) db.users = {};
+  db.users[uid] = {
+    youtube: connections?.youtube ? String(connections.youtube) : null,
+    tiktok: connections?.tiktok ? String(connections.tiktok) : null,
+    updatedAt: Date.now(),
+  };
+  writeJson(CONNECTIONS_FILE, db);
+  return db.users[uid];
+}
+
+function getSavedConnections(userId) {
+  const uid = String(userId || '').trim();
+  const db = readJson(CONNECTIONS_FILE, { users: {} });
+  return db.users?.[uid] || null;
 }
 
 async function exchangeCodeForToken({ clientId, clientSecret, redirectUri, code }) {
@@ -100,11 +176,61 @@ const app = express();
 
 app.get('/health', (req, res) => res.status(200).send('ok'));
 
+app.get('/status', (req, res) => {
+  const clientId = env('DISCORD_CLIENT_ID').trim();
+  const redirectUri = env('DISCORD_REDIRECT_URI').trim();
+  const webhookUrl = env('DISCORD_RELAY_WEBHOOK_URL').trim();
+  const hasSecret = Boolean(env('DISCORD_CLIENT_SECRET').trim());
+  const hasHmac = Boolean(env('RELAY_HMAC_SECRET').trim());
+  const hasApiKey = Boolean(env('AURABOT_API_KEY').trim());
+
+  res.status(200).json({
+    ok: Boolean(clientId && redirectUri && hasSecret && (hasApiKey || (webhookUrl && hasHmac))),
+    configured: {
+      DISCORD_CLIENT_ID: Boolean(clientId),
+      DISCORD_CLIENT_SECRET: hasSecret,
+      DISCORD_REDIRECT_URI: Boolean(redirectUri),
+      AURABOT_API_KEY: hasApiKey,
+      DISCORD_RELAY_WEBHOOK_URL: Boolean(webhookUrl),
+      RELAY_HMAC_SECRET: hasHmac,
+    },
+    values: {
+      DISCORD_REDIRECT_URI: redirectUri || null,
+      RELAY_PREFIX: env('RELAY_PREFIX', 'CONNECTION_DATA').trim() || 'CONNECTION_DATA',
+      POST_SUCCESS_REDIRECT: env('POST_SUCCESS_REDIRECT').trim() || null,
+    },
+  });
+});
+
+app.get('/api/connections/:userId', (req, res) => {
+  const apiKey = env('AURABOT_API_KEY').trim();
+  if (!apiKey) {
+    res.status(500).json({ error: 'Server not configured (missing AURABOT_API_KEY).' });
+    return;
+  }
+
+  const provided = String(req.header('x-api-key') || '').trim();
+  if (!provided || !timingSafeEq(provided, apiKey)) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return;
+  }
+
+  const userId = String(req.params.userId || '').trim();
+  const entry = getSavedConnections(userId);
+  if (!entry) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+
+  res.status(200).json({ userId, ...entry });
+});
+
 app.get('/connect', (req, res) => {
   const clientId = env('DISCORD_CLIENT_ID').trim();
   const redirectUri = env('DISCORD_REDIRECT_URI').trim();
   if (!clientId || !redirectUri) {
-    res.status(500).send('Missing DISCORD_CLIENT_ID or DISCORD_REDIRECT_URI.');
+    const missing = missingEnv(['DISCORD_CLIENT_ID', 'DISCORD_REDIRECT_URI']);
+    res.status(500).send(`Server not configured.\nMissing: ${missing.join(', ') || 'unknown'}`);
     return;
   }
 
@@ -127,21 +253,37 @@ app.get('/callback', async (req, res) => {
   const clientId = env('DISCORD_CLIENT_ID').trim();
   const clientSecret = env('DISCORD_CLIENT_SECRET').trim();
   const redirectUri = env('DISCORD_REDIRECT_URI').trim();
+  const apiKey = env('AURABOT_API_KEY').trim();
   const webhookUrl = env('DISCORD_RELAY_WEBHOOK_URL').trim();
   const relayPrefix = env('RELAY_PREFIX', 'CONNECTION_DATA').trim() || 'CONNECTION_DATA';
   const relaySecret = env('RELAY_HMAC_SECRET').trim();
   const postRedirect = env('POST_SUCCESS_REDIRECT').trim();
 
-  if (!clientId || !clientSecret || !redirectUri) {
-    res.status(500).send(html('AuraBot', '<h2>Server not configured</h2><p class="muted">Missing OAuth env vars.</p>'));
+  const missingOAuth = missingEnv(['DISCORD_CLIENT_ID', 'DISCORD_CLIENT_SECRET', 'DISCORD_REDIRECT_URI']);
+  if (missingOAuth.length > 0) {
+    res
+      .status(500)
+      .send(
+        html(
+          'AuraBot',
+          `<h2>Server not configured</h2><p class="muted">Missing OAuth env vars: <code>${missingOAuth.join(
+            ', ',
+          )}</code></p><p class="muted">On Render, set these in the dashboard Environment. For local runs, create <code>render-auth/.env</code>.</p>`,
+        ),
+      );
     return;
   }
-  if (!webhookUrl) {
-    res.status(500).send(html('AuraBot', '<h2>Server not configured</h2><p class="muted">Missing DISCORD_RELAY_WEBHOOK_URL.</p>'));
-    return;
-  }
-  if (!relaySecret) {
-    res.status(500).send(html('AuraBot', '<h2>Server not configured</h2><p class="muted">Missing RELAY_HMAC_SECRET.</p>'));
+  const webhookRelayEnabled = Boolean(webhookUrl && relaySecret);
+  const apiEnabled = Boolean(apiKey);
+  if (!webhookRelayEnabled && !apiEnabled) {
+    res
+      .status(500)
+      .send(
+        html(
+          'AuraBot',
+          '<h2>Server not configured</h2><p class="muted">Set <code>AURABOT_API_KEY</code> (recommended) or set both <code>DISCORD_RELAY_WEBHOOK_URL</code> and <code>RELAY_HMAC_SECRET</code> (legacy).</p>',
+        ),
+      );
     return;
   }
 
@@ -157,12 +299,16 @@ app.get('/callback', async (req, res) => {
     const userId = String(user?.id || '').trim();
     if (!userId) throw new Error('Missing user id');
 
+    // Save for bot polling (no webhook needed)
+    saveConnections(userId, picked);
+
     const ts = String(Date.now());
     const payload = `${userId}|${picked.youtube || ''}|${picked.tiktok || ''}|${ts}`;
-    const sig = hmacSig(relaySecret, payload);
-    const content = `${relayPrefix}|${userId}|${picked.youtube || ''}|${picked.tiktok || ''}|${ts}|${sig}`;
-
-    await postWebhook(webhookUrl, content);
+    if (webhookRelayEnabled) {
+      const sig = hmacSig(relaySecret, payload);
+      const content = `${relayPrefix}|${userId}|${picked.youtube || ''}|${picked.tiktok || ''}|${ts}|${sig}`;
+      await postWebhook(webhookUrl, content);
+    }
 
     if (postRedirect) {
       res.redirect(postRedirect);
@@ -184,8 +330,31 @@ app.get('/callback', async (req, res) => {
         ),
       );
   } catch (e) {
+    const ax = e;
+    const status = ax?.response?.status;
+    const data = ax?.response?.data;
     const msg = e instanceof Error ? e.message : String(e);
-    res.status(500).send(html('AuraBot Error', `<h2>Error</h2><p class="muted">${msg}</p>`));
+    // eslint-disable-next-line no-console
+    console.error('[render-auth] callback failed:', { msg, status, data });
+
+    const hint =
+      status === 400
+        ? 'Check that your Redirect URI matches exactly in Discord Developer Portal and in DISCORD_REDIRECT_URI.'
+        : status === 401
+          ? 'Check DISCORD_CLIENT_SECRET (rotate it if leaked).'
+          : 'Check your Render environment variables.';
+
+    res
+      .status(500)
+      .send(
+        html(
+          'AuraBot Error',
+          `<h2>Error</h2>
+           <p class="muted">${msg}</p>
+           <p class="muted">${hint}</p>
+           <p class="muted">Open <code>/status</code> on this service to verify configuration.</p>`,
+        ),
+      );
   }
 });
 
