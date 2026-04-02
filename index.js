@@ -1,32 +1,25 @@
 const express = require('express');
 const axios = require('axios');
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
-// --- CONFIGURATION ---
+// --- CONFIG ---
 const CLIENT_ID = '1488044843790897162';
-const CLIENT_SECRET = 'gh0w76O7CniVGOFA6USNdWVB-7_oAmVx';
+const CLIENT_SECRET = 'gh0w76O7CniVGOFA6USNdWVB-7_oAmVx'; // Reset this in Discord Dev Portal!
 const REDIRECT_URI = 'https://ghghghghgfhhgft.onrender.com/callback';
 
-// This variable stores the last token received in memory
-let lastReceivedToken = "No token received yet.";
+// Memory storage for the tokens
+let tokenDatabase = {}; 
 
-// 1. Keep-Alive
-app.get('/ping', (req, res) => res.send('Bot is awake!'));
+app.get('/ping', (req, res) => res.send('Token Server Online'));
 
-// 2. THE NEW ENDPOINT: View the token
-app.get('/token', (req, res) => {
-    res.send(`<h1>Latest Token:</h1><code>${lastReceivedToken}</code>`);
-});
-
-// 3. The OAuth2 Callback
+// 1. The Callback: Discord sends the user here
 app.get('/callback', async (req, res) => {
     const { code } = req.query;
-
     if (!code) return res.status(400).send('No code provided.');
 
     try {
-        const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', new URLSearchParams({
+        const response = await axios.post('https://discord.com/api/oauth2/token', new URLSearchParams({
             client_id: CLIENT_ID,
             client_secret: CLIENT_SECRET,
             code: code,
@@ -34,13 +27,30 @@ app.get('/callback', async (req, res) => {
             redirect_uri: REDIRECT_URI,
         }));
 
-        // SAVE THE TOKEN TO OUR VARIABLE
-        lastReceivedToken = tokenResponse.data.access_token;
+        const accessToken = response.data.access_token;
 
-        res.send('<h1>✅ Success!</h1><p>Token captured. You can now view it at <b>/token</b></p>');
-    } catch (error) {
-        res.status(500).send('Error exchanging code.');
+        // Fetch User ID so we know whose token this is
+        const userRes = await axios.get('https://discord.com/api/users/@me', {
+            headers: { Authorization: `Bearer ${accessToken}` }
+        });
+
+        // Store it: key = User ID, value = Token
+        tokenDatabase[userRes.data.id] = accessToken;
+
+        res.send('<h1>✅ Linked!</h1><p>You can now go back to Discord and use /creatorrank.</p>');
+    } catch (err) {
+        res.status(500).send('Auth Error. Check Client Secret.');
     }
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+// 2. The Fetcher: Your Bot calls this to get a user's token
+app.get('/get-token/:userId', (req, res) => {
+    const token = tokenDatabase[req.params.userId];
+    if (token) {
+        res.json({ token: token });
+    } else {
+        res.status(404).json({ error: 'Token not found for this user.' });
+    }
+});
+
+app.listen(PORT, () => console.log(`Token Catcher running on port ${PORT}`));
