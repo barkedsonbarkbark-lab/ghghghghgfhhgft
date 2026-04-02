@@ -2,6 +2,7 @@
  * Note: Render normally expects env vars set in the dashboard; .env files are not
  * uploaded unless you commit them (not recommended for secrets). */
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 // eslint-disable-next-line global-require
 const dotenv = require('dotenv');
@@ -27,13 +28,27 @@ const crypto = require('node:crypto');
 const express = require('express');
 const axios = require('axios');
 
-const DATA_DIR = path.join(__dirname, '..', 'data');
-const CONNECTIONS_FILE = path.join(DATA_DIR, 'connections.json');
-
 function env(name, fallback = '') {
   const v = process.env[name];
   return v == null ? fallback : String(v);
 }
+
+function resolveDataDir() {
+  const explicit = env('DATA_DIR', '').trim();
+  if (explicit) return explicit;
+
+  // Render/production filesystems can be ephemeral or read-only in the repo dir.
+  // Prefer OS temp directory in production-ish environments.
+  const isProd = env('NODE_ENV', '').trim() === 'production' || Boolean(env('RENDER', '').trim());
+  if (isProd) return path.join(os.tmpdir(), 'aurabot-render-auth');
+
+  return path.join(__dirname, '..', 'data');
+}
+
+const DATA_DIR = resolveDataDir();
+const CONNECTIONS_FILE = path.join(DATA_DIR, 'connections.json');
+
+const memConnections = new Map(); // userId -> { youtube, tiktok, updatedAt }
 
 function base64url(buf) {
   return Buffer.from(buf)
@@ -89,12 +104,22 @@ function readJson(file, fallback) {
 
 function writeJson(file, value) {
   ensureDir();
-  fs.writeFileSync(file, JSON.stringify(value, null, 2), 'utf8');
+  try {
+    fs.writeFileSync(file, JSON.stringify(value, null, 2), 'utf8');
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[render-auth] Failed to write DB file:', { file, msg: e instanceof Error ? e.message : String(e) });
+  }
 }
 
 function saveConnections(userId, connections) {
   const uid = String(userId || '').trim();
   if (!uid) return null;
+  memConnections.set(uid, {
+    youtube: connections?.youtube ? String(connections.youtube) : null,
+    tiktok: connections?.tiktok ? String(connections.tiktok) : null,
+    updatedAt: Date.now(),
+  });
   const db = readJson(CONNECTIONS_FILE, { users: {} });
   if (!db.users) db.users = {};
   db.users[uid] = {
@@ -108,6 +133,8 @@ function saveConnections(userId, connections) {
 
 function getSavedConnections(userId) {
   const uid = String(userId || '').trim();
+  const inMem = memConnections.get(uid);
+  if (inMem) return inMem;
   const db = readJson(CONNECTIONS_FILE, { users: {} });
   return db.users?.[uid] || null;
 }
@@ -129,6 +156,9 @@ function getDbSummary() {
       exists: fileExists,
       size: stat ? stat.size : 0,
       mtimeMs: stat ? stat.mtimeMs : null,
+    },
+    memory: {
+      count: memConnections.size,
     },
     users: {
       count: entries.length,
@@ -223,6 +253,7 @@ app.get('/status', (req, res) => {
       DISCORD_REDIRECT_URI: redirectUri || null,
       RELAY_PREFIX: env('RELAY_PREFIX', 'CONNECTION_DATA').trim() || 'CONNECTION_DATA',
       POST_SUCCESS_REDIRECT: env('POST_SUCCESS_REDIRECT').trim() || null,
+      DATA_DIR,
     },
   });
 });
