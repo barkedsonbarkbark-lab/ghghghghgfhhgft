@@ -1,3 +1,9 @@
+/* Load env vars from a local .env file (Render usually uses dashboard env vars,
+ * but this keeps local/self-hosted deployments working too). */
+const path = require('node:path');
+// eslint-disable-next-line global-require
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+
 const crypto = require('node:crypto');
 const express = require('express');
 const axios = require('axios');
@@ -188,4 +194,3 @@ app.listen(port, () => {
   // eslint-disable-next-line no-console
   console.log(`Render auth relay listening on :${port}`);
 });
-
